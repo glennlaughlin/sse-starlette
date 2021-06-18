@@ -6,14 +6,44 @@ import io
 import logging
 import re
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, Generator, Iterator, Optional, Union
+from typing import Any, Optional, Union
 
 from starlette.background import BackgroundTask
-from starlette.concurrency import iterate_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_until_first_complete
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-_log = logging.getLogger(__name__)
+
+# https://stackoverflow.com/questions/58133694/graceful-shutdown-of-uvicorn-starlette-app-with-websockets
+class AppStatus:
+    """ helper for monkeypatching the signal-handler of uvicorn """
+
+    should_exit = False
+
+    @staticmethod
+    def handle_exit(*args, **kwargs):
+        AppStatus.should_exit = True
+        original_handler(*args, **kwargs)
+
+
+try:
+    from uvicorn.config import logger as _log  # TODO: remove
+    from uvicorn.main import Server
+
+    original_handler = Server.handle_exit
+    Server.handle_exit = AppStatus.handle_exit
+
+    def unpatch_uvicorn_signal_handler():
+        """restores original signal-handler and rolls back monkey-patching.
+        Normally this should not be necessary.
+        """
+        Server.handle_exit = original_handler
+
+
+except ModuleNotFoundError as e:
+    _log = logging.getLogger(__name__)
+    # logging.basicConfig(level=logging.INFO)
+    _log.debug(f"Uvicorn not used, falling back to python standard logging.")
 
 
 class SseState(enum.Enum):
@@ -32,16 +62,6 @@ class ServerSentEvent:
         retry: Optional[int] = None,
         sep: str = None,
     ) -> None:
-        self.data = data
-        self.event = event
-        self.id = id
-        self.retry = retry
-
-        self.DEFAULT_SEPARATOR = "\r\n"
-        self.LINE_SEP_EXPR = re.compile(r"\r\n|\r|\n")
-        self._sep = sep if sep is not None else self.DEFAULT_SEPARATOR
-
-    def encode(self) -> bytes:
         """Send data using EventSource protocol
 
         :param str data: The data field for the message.
@@ -56,6 +76,16 @@ class ServerSentEvent:
             specifying the reconnection time in milliseconds. If a non-integer
             value is specified, the field is ignored.
         """
+        self.data = data
+        self.event = event
+        self.id = id
+        self.retry = retry
+
+        self.DEFAULT_SEPARATOR = "\r\n"
+        self.LINE_SEP_EXPR = re.compile(r"\r\n|\r|\n")
+        self._sep = sep if sep is not None else self.DEFAULT_SEPARATOR
+
+    def encode(self) -> bytes:
         buffer = io.StringIO()
         if self.id is not None:
             buffer.write(self.LINE_SEP_EXPR.sub("", f"id: {self.id}"))
@@ -80,21 +110,17 @@ class ServerSentEvent:
 
 
 class EventSourceResponse(Response):
-    """ Implements the ServerSentEvent Protocol: https://www.w3.org/TR/2009/WD-eventsource-20090421/
+    """Implements the ServerSentEvent Protocol: https://www.w3.org/TR/2009/WD-eventsource-20090421/
 
-        Responses must not be compressed by middleware in order to work properly.
+    Responses must not be compressed by middleware in order to work properly.
     """
 
     DEFAULT_PING_INTERVAL = 15
 
+    # noinspection PyMissingConstructor: follow Starlette StreamingResponse
     def __init__(
         self,
         content: Any,
-        # content: Iterator[Any],
-        # content: Union[
-        #     Generator[Union[str, Dict], None, None],
-        #     AsyncGenerator[Union[str, Dict], None],
-        # ],
         status_code: int = 200,
         headers: dict = None,
         media_type: str = "text/html",
@@ -102,6 +128,7 @@ class EventSourceResponse(Response):
         ping: int = None,
         sep: str = None,
     ) -> None:
+        # super().__init__()  # follow Starlette StreamingResponse
         self.sep = sep
         if inspect.isasyncgen(content):
             self.body_iterator = content
@@ -132,7 +159,33 @@ class EventSourceResponse(Response):
         self._loop = asyncio.get_event_loop()
         self._ping_task = None
 
+    @staticmethod
+    async def listen_for_disconnect(receive: Receive) -> None:
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                _log.debug(f"Got event: http.disconnect. Stop streaming.")
+                break
+
+    @staticmethod
+    async def listen_for_exit_signal() -> None:
+        while not AppStatus.should_exit:
+            await asyncio.sleep(1.0)
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await run_until_first_complete(
+            (self.stream_response, {"send": send}),
+            (self.listen_for_disconnect, {"receive": receive}),
+            (self.listen_for_exit_signal, {}),
+        )
+        self.stop_streaming()
+        await self.wait()
+        _log.debug(f"streaming stopped.")
+
+        if self.background is not None:  # pragma: no cover, tested in StreamResponse
+            await self.background()
+
+    async def stream_response(self, send) -> None:
         await send(
             {
                 "type": "http.response.start",
@@ -150,18 +203,11 @@ class EventSourceResponse(Response):
                 chunk = ServerSentEvent(str(data), sep=self.sep).encode()
             _log.debug(f"chunk: {chunk.decode()}")
             await send({"type": "http.response.body", "body": chunk, "more_body": True})
-
-        self.stop_streaming()
-        await self.wait()
-        _log.debug(f"streaming stopped.")
         await send({"type": "http.response.body", "body": b"", "more_body": False})
-
-        if self.background is not None:  # pragma: no cover, tested in StreamResponse
-            await self.background()
 
     async def wait(self) -> None:
         """EventSourceResponse object is used for streaming data to the client,
-        this method returns future, so we can wain until connection will
+        this method returns future, so we can wait until connection will
         be closed or other task explicitly call ``stop_streaming`` method.
         """
         if self._ping_task is None:
@@ -202,10 +248,12 @@ class EventSourceResponse(Response):
 
     async def _ping(self, send: Send) -> None:
         # Legacy proxy servers are known to, in certain cases, drop HTTP connections after a short timeout.
-        # To protect against such proxy servers, authors can include a comment line
-        # (one starting with a ':' character) every 15 seconds or so.
+        # To protect against such proxy servers, authors can send a custom (ping) event
+        # every 15 seconds or so.
+        # Alternatively one can send periodically a comment line
+        # (one starting with a ':' character)
         while self.active:
             await asyncio.sleep(self._ping_interval)
-            ping = ServerSentEvent(f": ping {datetime.utcnow()}").encode()
+            ping = ServerSentEvent(datetime.utcnow(), event="ping").encode()
             _log.debug(f"ping: {ping.decode()}")
             await send({"type": "http.response.body", "body": ping, "more_body": True})
