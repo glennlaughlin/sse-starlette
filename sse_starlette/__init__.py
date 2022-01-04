@@ -1,4 +1,3 @@
-from sse_starlette.sse import ServerSentEvent
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
-__version__ = "0.6.2"
-__all__ = ["ServerSentEvent"]
+__all__ = ["ServerSentEvent", "EventSourceResponse"]

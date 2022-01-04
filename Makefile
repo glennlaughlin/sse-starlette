@@ -4,7 +4,7 @@
 SOURCEDIR     = source
 BUILDDIR      = build
 MAKE          = make
-VERSION       = $(shell cat sse_starlette/__init__.py | grep __version__ | sed "s/__version__ = //" | sed "s/'//g")
+VERSION       = $(shell cat VERSION)
 
 app_root = .
 pkg_src =  $(app_root)/sse_starlette
@@ -80,8 +80,12 @@ black:  ## formatting with black
 isort:  ## sort imports
 	$(isort)
 
-.PHONY: bump
-bump:  ## bump
+.PHONY: bump-minor
+bump-minor:  ## bump-minor
+	bumpversion --verbose minor
+
+.PHONY: bump-patch
+bump-patch:  ## bump-patch
 	#bumpversion --dry-run --allow-dirty --verbose patch
 	bumpversion --verbose patch
 

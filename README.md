@@ -77,6 +77,18 @@ make test
 ```
 
 ## Changelog
+### 0.10.0 (2021-12-14)
+- base EventSourceResponse on latest starlette StreamingResponse (0.17.1) and use anyio
+- breaking change: `response.wait()` and `response.stop_streaming()` removed
+
+### 0.9.0 (2021-10-09)
+- add sse comment support
+
+### 0.8.1 (2021-09-30)
+- minimum required python version relaxed to python 3.6
+
+### 0.8.0 (2021-08-26)
+- using module-based logger instead of uvicorn logger
 
 ### 0.7.2 (2021-04-18)
 - refactoring: Github Actions introduced into build pipeline
